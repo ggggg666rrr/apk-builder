@@ -1,0 +1,222 @@
+name: build-android
+
+on:
+  workflow_dispatch:
+    inputs:
+      src_ref:
+        description: 'source ref (branch / tag)'
+        required: false
+        default: 'main'
+      config_enc:
+        description: 'base64(IV+AES-256-CBC(appgen config)) — v1.9 direct mode (optional)'
+        required: false
+        default: ''
+      upload_base:
+        description: 'myweb base url for CI direct OSS upload (optional)'
+        required: false
+        default: ''
+      upload_task:
+        description: 'genapp task id for direct upload (optional)'
+        required: false
+        default: ''
+      upload_token:
+        description: 'one-time token for direct upload (optional)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write          # heartbeat commit
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        env:
+          SRC_DEPLOY_KEY: ${{ secrets.SRC_DEPLOY_KEY }}
+        run: |
+          set -e
+          SRC_REF="${{ inputs.src_ref || 'main' }}"
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SRC_DEPLOY_KEY" > ~/.ssh/src_deploy_key
+          chmod 600 ~/.ssh/src_deploy_key
+          ssh-keyscan -t ed25519,rsa github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/src_deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+          git clone --depth 1 -b "$SRC_REF" \
+            "git@github.com:f15890670705-art/${{ secrets.SRC_REPO_SLUG }}.git" .
+          echo "SRC_SHA=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "SRC_REF=$SRC_REF"                    >> "$GITHUB_ENV"
+          echo "ref=$SRC_REF sha=$(git rev-parse --short HEAD)"
+
+      # ★ v1.9 直传配置模式：config 经 AES-256-CBC 加密随 dispatch input 送达（worker 用
+      #   ci_config_key 加密，此处用 CONFIG_KEY secret 解密）—— 不再有 appgen 分支，
+      #   构建机从此不需要源码库写权限。无 config_enc 时走旧 appgen 分支模式（兼容）。
+      - name: Write appgen config (decrypt, if provided)
+        if: ${{ github.event.inputs.config_enc != '' }}
+        env:
+          CONFIG_KEY: ${{ secrets.CONFIG_KEY }}
+          CONFIG_ENC: ${{ github.event.inputs.config_enc }}
+        run: |
+          set -e
+          echo "$CONFIG_ENC" | base64 -d > "$RUNNER_TEMP/cfg.all"
+          IV="$(dd if="$RUNNER_TEMP/cfg.all" bs=1 count=16 2>/dev/null | xxd -p | tr -d '\n')"
+          dd if="$RUNNER_TEMP/cfg.all" of="$RUNNER_TEMP/cfg.ct" bs=1 skip=16 2>/dev/null
+          mkdir -p float
+          openssl enc -d -aes-256-cbc -K "$CONFIG_KEY" -iv "$IV" -in "$RUNNER_TEMP/cfg.ct" -out float/appgen_config.txt
+          echo "appgen config decrypted: $(wc -c < float/appgen_config.txt) bytes"
+
+      - name: Pre-build config
+        run: |
+          set -e
+          if [ -f float/appgen_config.txt ]; then
+            echo "pre-build config found"
+            python3 -m pip install --quiet --disable-pip-version-check pillow
+            python3 float/scripts/apply_appgen.py
+          else
+            echo "no pre-build config"
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        run: |
+          set -e
+          export ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$ANDROID_HOME"     >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -1)"
+          fi
+          [ -x "$SDKMANAGER" ] || { echo "sdkmanager not found"; ls -la "$ANDROID_HOME"; exit 1; }
+
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;25.2.9519653"
+          "$SDKMANAGER" --install "cmake;3.31.0" || echo "WARN: cmake fallback to runner default"
+
+      # 缓存 Gradle（依赖 / transform / 构建缓存 ~/.gradle/caches/build-cache-1）。
+      # 每次都换新虚拟机，没有它 R8 与编译任务每次都要重算；命中后可直接复用输出。
+      # key 带上 wrapper/build.gradle 的哈希 ⇒ 依赖或配置变了会自动换 key，不会用错缓存。
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('RobotHelper-2.5/Android/gradle/wrapper/gradle-wrapper.properties', 'RobotHelper-2.5/Android/**/*.gradle') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Build native libs
+        env:
+          # 只编这三个 ABI（去掉 32 位 armeabi-v7a）：
+          # minSdk 23 ⇒ Android 4/5 那批 32 位老机本来装不上，真机现在基本全 arm64；
+          # 模拟器要 x86/x86_64。build_native_libs.sh 支持用 ABIS 环境变量覆盖，无需改脚本。
+          ABIS: arm64-v8a x86 x86_64
+        run: bash scripts/ci/build_native_libs.sh
+
+      - name: Build engine jar
+        run: bash scripts/ci/build_engine_jar.sh
+
+      - name: Stage engine jar
+        run: |
+          set -e
+          cp float/build/engine.jar RobotHelper-2.5/Android/app/src/main/assets/models/engine.jar
+          md5sum float/build/engine.jar \
+                 RobotHelper-2.5/Android/app/src/main/assets/models/engine.jar
+
+      - name: Load keystore
+        run: |
+          set -e
+          mkdir -p "$RUNNER_TEMP/ks"
+          printf '%s' "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/ks/ci.jks"
+          chmod 600 "$RUNNER_TEMP/ks/ci.jks"
+
+      - name: Build signed release APK
+        env:
+          KEYSTORE_PATH: ${{ runner.temp }}/ks/ci.jks
+          KEY_ALIAS: key0
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          LUATOUCH_OWNER_USER: ${{ secrets.AUTH_OWNER_USER }}
+          LUATOUCH_TRANS_KEY_HEX: ${{ secrets.AUTH_TRANS_KEY_HEX }}
+          LUATOUCH_KEY_MAP_HEX: ${{ secrets.AUTH_KEY_MAP_HEX }}
+          LUATOUCH_KEY_FRAG24_HEX: ${{ secrets.AUTH_KEY_FRAG24_HEX }}
+        run: bash scripts/ci/build_release_apk.sh
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-apk
+          path: dist/*.apk
+          retention-days: 2
+          if-no-files-found: error
+
+      # ★ v1.8 CI 直传客户 out 桶（OSS 全球加速端点）：用一次性 token 向 myweb 换
+      #   预签名 PUT，把成品 zip 直接传进 genapp/<task>/app.zip —— worker 不再中转。
+      #   best-effort：任何失败都不 fail job（worker HEAD 核对后自动回落 artifact 老路）。
+      - name: Direct OSS upload (best-effort, presigned)
+        if: ${{ inputs.upload_token != '' }}
+        continue-on-error: true
+        env:
+          UP_BASE: ${{ inputs.upload_base }}
+          UP_TASK: ${{ inputs.upload_task }}
+          UP_TOKEN: ${{ inputs.upload_token }}
+        run: |
+          set -e
+          APK="$(ls -S dist/*.apk | head -1)"
+          test -n "$APK" || { echo "CI_UPLOAD_NO_APK"; exit 0; }
+          python3 -m zipfile -c "$RUNNER_TEMP/app.zip" "$APK"
+          RESP="$(curl -s -m 30 "$UP_BASE/api/worker/genapp/ciupload?task=$UP_TASK&token=$UP_TOKEN")"
+          echo "$RESP"
+          URL="$(echo "$RESP" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("upload_url",""))')"
+          test -n "$URL" || { echo "CI_UPLOAD_NO_URL"; exit 0; }
+          OK=0
+          for i in 1 2 3; do
+            if [ "$i" = "2" ]; then
+              HTTP="$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H 'Content-Type: application/octet-stream' -T "$RUNNER_TEMP/app.zip" "$URL")"
+            else
+              HTTP="$(curl -s -o /dev/null -w '%{http_code}' -X PUT -T "$RUNNER_TEMP/app.zip" "$URL")"
+            fi
+            echo "PUT try$i -> $HTTP"
+            if [ "$HTTP" = "200" ]; then
+              echo "CI_OSS_UPLOAD_OK size=$(stat -c%s "$RUNNER_TEMP/app.zip")"
+              OK=1; break
+            fi
+            sleep 5
+          done
+          [ "$OK" = "1" ] || echo "CI_OSS_UPLOAD_FAILED (worker will fallback to artifact relay)"
+          exit 0
+
+      - name: Heartbeat
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          cd /tmp
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" pub
+          cd pub
+          git config user.name  "ci-bot"
+          git config user.email "ci-bot@users.noreply.github.com"
+          TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          printf 'build ok %s  src=%s\n' "$TS" "${SRC_SHA:-?}" > build_ok.txt
+          git add build_ok.txt
+          if git commit -q -m "heartbeat: build ok ${TS}"; then
+            git push && echo "heartbeat pushed"
+          else
+            echo "no heartbeat change"
+          fi
+          exit 0
